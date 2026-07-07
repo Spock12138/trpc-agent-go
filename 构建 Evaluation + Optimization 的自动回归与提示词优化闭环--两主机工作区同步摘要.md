@@ -307,3 +307,123 @@ git push
 6. `git log --oneline -10`
 7. `git status`
 8. 开始实现
+
+
+
+
+固定的操作顺序：
+可以。以后你就把它当成一个固定的“两主机交接协议”。
+
+**第一次接入某台机器**
+
+只在这台机器第一次使用 workspace 分支时执行：
+
+```powershell
+cd D:\project\OpensourceTencent\trpc-agent-go
+
+git fetch spock
+git switch --track spock/feat/eval-optimization-loop-workspace
+```
+
+如果本机已经有这个分支，以后不要再用 `--track`，直接切换即可：
+
+```powershell
+git switch feat/eval-optimization-loop-workspace
+```
+
+**每次开始工作前**
+
+```powershell
+cd D:\project\OpensourceTencent\trpc-agent-go
+
+git switch feat/eval-optimization-loop-workspace
+git fetch spock
+git pull --ff-only
+git status
+```
+
+确认看到类似：
+
+```text
+On branch feat/eval-optimization-loop-workspace
+nothing to commit, working tree clean
+```
+
+然后再开始开发。
+
+**工作过程中提交**
+
+代码和笔记尽量分开提交：
+
+```powershell
+git status
+git add -p
+git commit -m "feat: xxx"
+```
+
+笔记类：
+
+```powershell
+git add "*.md"
+git commit -m "docs: update workspace notes"
+```
+
+临时保存也可以：
+
+```powershell
+git add -A
+git commit -m "wip: save workspace progress"
+```
+
+**每次结束工作后**
+
+这是最重要的交接动作：
+
+```powershell
+git status
+git add -A
+git commit -m "wip: save workspace progress"
+git push spock feat/eval-optimization-loop-workspace
+git status
+```
+
+如果 `git status` 显示没有改动，可以跳过 `add/commit`，只确认是否需要 push：
+
+```powershell
+git status
+git push spock feat/eval-optimization-loop-workspace
+```
+
+**另一台机器接手时**
+
+```powershell
+cd D:\project\OpensourceTencent\trpc-agent-go
+
+git switch feat/eval-optimization-loop-workspace
+git fetch spock
+git pull --ff-only
+git status
+```
+
+**铁律**
+
+1. 开工前：`pull --ff-only`
+2. 收工前：`commit + push`
+3. 不要从 `feat/eval-optimization-loop-workspace` 直接提 PR
+4. 最终 PR 从 `main` 新建干净分支 `feat/eval-optimization-loop`
+5. workspace 分支可以乱一点，PR 分支必须干净一点
+
+如果你只记一个最短版：
+
+```powershell
+# 开工
+git switch feat/eval-optimization-loop-workspace
+git pull --ff-only
+
+# 收工
+git add -A
+git commit -m "wip: save workspace progress"
+git push spock feat/eval-optimization-loop-workspace
+```
+
+这个流程就够用了。
