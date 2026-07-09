@@ -422,6 +422,37 @@ func TestDescribeUsesInjectedStructure(t *testing.T) {
 	assert.Equal(t, structure, result)
 }
 
+func TestEvaluateWithProfileUsesProvidedProfile(t *testing.T) {
+	evalService := newScriptedEvalService(scriptedOutcome)
+	engineInstance, err := New(
+		context.Background(),
+		WithAgentEvaluator(newTestAgentEvaluator(t, evalService)),
+		WithBackwarder(&fakeBackwarder{}),
+		WithAggregator(&fakeAggregator{}),
+		WithOptimizer(&fakeOptimizer{}),
+		WithAgent(testTargetAgent()),
+	)
+	require.NoError(t, err)
+	profileEvaluator, ok := engineInstance.(ProfileEvaluator)
+	require.True(t, ok)
+	result, err := profileEvaluator.EvaluateWithProfile(context.Background(), EvalSetInput{
+		EvalSetID: "validation",
+	}, &promptiter.Profile{
+		Overrides: []promptiter.SurfaceOverride{
+			{
+				SurfaceID: testSurfaceID,
+				Value: astructure.SurfaceValue{
+					Text: stringPtr("accepted prompt"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 0.8, result.OverallScore)
+	assert.Equal(t, "accepted prompt", evalService.profileByEvalSet["validation"])
+}
+
 func TestRunAcceptsFirstRoundAndStopsAfterRejectedNextRound(t *testing.T) {
 	backward := &fakeBackwarder{
 		fn: func(ctx context.Context, request *backwarder.Request) (*backwarder.Result, error) {
@@ -1909,6 +1940,16 @@ func TestAdaptEvaluationCaseResultUsesFirstRunWhenMultipleRunsExist(t *testing.T
 						EvalStatus: status.EvalStatusPassed,
 					},
 				},
+				EvalMetricResultPerInvocation: []*evalresult.EvalMetricResultPerInvocation{
+					{
+						ActualInvocation: &evalset.Invocation{
+							InvocationID: "actual_first",
+						},
+						ExpectedInvocation: &evalset.Invocation{
+							InvocationID: "expected_first",
+						},
+					},
+				},
 			},
 			{
 				RunID: 2,
@@ -1917,6 +1958,16 @@ func TestAdaptEvaluationCaseResultUsesFirstRunWhenMultipleRunsExist(t *testing.T
 						MetricName: "quality",
 						Score:      0.1,
 						EvalStatus: status.EvalStatusPassed,
+					},
+				},
+				EvalMetricResultPerInvocation: []*evalresult.EvalMetricResultPerInvocation{
+					{
+						ActualInvocation: &evalset.Invocation{
+							InvocationID: "actual_second",
+						},
+						ExpectedInvocation: &evalset.Invocation{
+							InvocationID: "expected_second",
+						},
 					},
 				},
 			},
@@ -1987,6 +2038,10 @@ func TestAdaptEvaluationCaseResultUsesFirstRunWhenMultipleRunsExist(t *testing.T
 	assert.Equal(t, "session_first", result.SessionID)
 	assert.Len(t, result.Metrics, 1)
 	assert.Equal(t, 0.9, result.Metrics[0].Score)
+	require.NotNil(t, result.ActualInvocation)
+	require.NotNil(t, result.ExpectedInvocation)
+	assert.Equal(t, "actual_first", result.ActualInvocation.InvocationID)
+	assert.Equal(t, "expected_first", result.ExpectedInvocation.InvocationID)
 }
 
 func TestRunRejectsEmptyValidationEvalSets(t *testing.T) {

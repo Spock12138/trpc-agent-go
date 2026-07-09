@@ -36,6 +36,12 @@ type Engine interface {
 	Run(ctx context.Context, request *RunRequest, opts ...Option) (*RunResult, error)
 }
 
+// ProfileEvaluator optionally exposes one-off evaluation for a specific profile.
+type ProfileEvaluator interface {
+	// EvaluateWithProfile evaluates one eval set input using the provided profile.
+	EvaluateWithProfile(ctx context.Context, input EvalSetInput, profile *promptiter.Profile) (*EvaluationResult, error)
+}
+
 // RunRequest carries the inputs required to start PromptIter optimization.
 type RunRequest struct {
 	// Train identifies evaluation data used to generate gradients.
