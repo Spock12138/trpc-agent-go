@@ -1,0 +1,5 @@
+{
+  "maxRounds": 1,
+  "minScoreGain": 0.01,
+  "targetScore": 1.0
+}
