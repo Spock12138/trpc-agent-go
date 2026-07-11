@@ -15,7 +15,7 @@
 - validation gain 0.500 meets minimum 0.050
 - new hard fail count is 1
 - critical regression count is 1
-- latency 19ms is below max 180000ms
+- latency 17ms is below max 180000ms
 - fake mode cost is 0
 
 ## Validation Delta
@@ -33,8 +33,3 @@
   - Patch `candidate#tool.lookup_record`: Use lookup_record only for flight delay questions.
 - Round 2: train 0.667, validation 0.750, accepted=true, delta=0.250
   - Patch `candidate#tool.lookup_record`: Use lookup_record for all flight questions, including delay, gate, and departure. Always look up any TR record before answering.
-
-## Remaining Work
-
-- `trace_smoke`
-- `design_doc`

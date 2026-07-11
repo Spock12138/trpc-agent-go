@@ -41,7 +41,9 @@ const (
 	candidateRunnerName = "promptiter-regression-loop-candidate"
 	trainEvalSetID      = "train"
 	validationEvalSetID = "validation"
+	traceSmokeEvalSetID = "trace_smoke"
 	defaultMode         = "fake"
+	traceSmokeMode      = "trace-smoke"
 	defaultSeed         = int64(42)
 )
 
@@ -104,10 +106,22 @@ type pipelineResult struct {
 
 type metricsFileLocator struct{}
 
+func runPipeline(ctx context.Context, cfg pipelineConfig) (*pipelineResult, error) {
+	cfg = normalizePipelineConfig(cfg)
+	switch cfg.Mode {
+	case defaultMode:
+		return runFakePipeline(ctx, cfg)
+	case traceSmokeMode:
+		return runTraceSmokePipeline(ctx, cfg)
+	default:
+		return nil, fmt.Errorf("unsupported mode %q: supported modes are %q and %q", cfg.Mode, defaultMode, traceSmokeMode)
+	}
+}
+
 func runFakePipeline(ctx context.Context, cfg pipelineConfig) (*pipelineResult, error) {
 	cfg = normalizePipelineConfig(cfg)
 	if cfg.Mode != defaultMode {
-		return nil, fmt.Errorf("unsupported mode %q: Phase 3 supports only %q", cfg.Mode, defaultMode)
+		return nil, fmt.Errorf("unsupported mode %q for fake pipeline", cfg.Mode)
 	}
 	start := time.Now()
 	prompt, err := readPromptSource(cfg.PromptPath)
@@ -165,6 +179,78 @@ func runFakePipeline(ctx context.Context, cfg pipelineConfig) (*pipelineResult, 
 	if err != nil {
 		return nil, err
 	}
+	jsonPath, markdownPath, err := writeOptimizationReport(cfg.OutputDir, report)
+	if err != nil {
+		return nil, err
+	}
+	return &pipelineResult{
+		Report:             report,
+		ReportJSONPath:     jsonPath,
+		ReportMarkdownPath: markdownPath,
+		Model:              fakeModel,
+		Backwarder:         runtime.backwarder,
+		Aggregator:         runtime.aggregator,
+		Optimizer:          runtime.optimizer,
+		Prompt:             prompt,
+	}, nil
+}
+
+func runTraceSmokePipeline(ctx context.Context, cfg pipelineConfig) (*pipelineResult, error) {
+	cfg = normalizePipelineConfig(cfg)
+	if cfg.Mode != traceSmokeMode {
+		return nil, fmt.Errorf("unsupported mode %q for trace smoke pipeline", cfg.Mode)
+	}
+	start := time.Now()
+	prompt, err := readPromptSource(cfg.PromptPath)
+	if err != nil {
+		return nil, err
+	}
+	iterCfg, err := readPromptIterConfig(cfg.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	fakeModel := &deterministicFlightModel{}
+	runtime, err := buildPromptIterRuntime(ctx, cfg, prompt.Text, iterCfg, fakeModel)
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.close()
+
+	snapshot, err := runtime.engine.Describe(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("describe promptiter engine: %w", err)
+	}
+	targetSurface, err := findTargetSurface(snapshot, iterCfg.TargetSurfaceIDs[0])
+	if err != nil {
+		return nil, err
+	}
+	baselineToolDescription := ""
+	if len(targetSurface.Value.Tools) > 0 {
+		baselineToolDescription = targetSurface.Value.Tools[0].Description
+	}
+	profileEvaluator, ok := runtime.engine.(promptiterengine.ProfileEvaluator)
+	if !ok {
+		return nil, errors.New("promptiter engine does not support profile evaluation")
+	}
+	evaluationResult, err := profileEvaluator.EvaluateWithProfile(ctx, promptiterengine.EvalSetInput{
+		EvalSetID: traceSmokeEvalSetID,
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate trace smoke eval set: %w", err)
+	}
+	report := buildTraceSmokeOptimizationReport(traceSmokeReportInput{
+		mode:                    cfg.Mode,
+		seed:                    cfg.Seed,
+		prompt:                  prompt,
+		targetSurfaceIDs:        iterCfg.TargetSurfaceIDs,
+		baselineToolDescription: baselineToolDescription,
+		evaluation:              evaluationResult,
+		latency:                 time.Since(start),
+		modelCallCount:          fakeModel.CallCount(),
+		workerCallCount: runtime.backwarder.callCount +
+			runtime.aggregator.callCount +
+			runtime.optimizer.callCount,
+	})
 	jsonPath, markdownPath, err := writeOptimizationReport(cfg.OutputDir, report)
 	if err != nil {
 		return nil, err

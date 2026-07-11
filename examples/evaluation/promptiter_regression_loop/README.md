@@ -1,6 +1,6 @@
 # PromptIter Regression Loop
 
-This Phase 3 example runs a deterministic Evaluation + PromptIter loop without any API key.
+This example runs a deterministic Evaluation + PromptIter loop without any API key.
 
 The main path still goes through real `llmagent`, `runner`, `evaluation.AgentEvaluator`, and `evaluation/workflow/promptiter/engine`. Fake code only replaces the candidate `model.Model` and the PromptIter worker interfaces.
 
@@ -26,7 +26,13 @@ go run . \
   -config ./config/promptiter.json
 ```
 
-## What Phase 3 Proves
+Trace smoke mode validates trace-mode evaluation compatibility without running optimization:
+
+```bash
+go run . -mode trace-smoke -output-dir ./output-trace
+```
+
+## What The Fake Loop Proves
 
 - The baseline prompt is read from `config/baseline_prompt.txt`, hashed, and passed into `llmagent.WithInstruction`.
 - Baseline evaluation uses a loyalty-profile tool declaration, so flight lookup cases fail deterministically.
@@ -39,6 +45,8 @@ go run . \
 - The final gate rejects publishing when validation improves but a new hard fail or critical-case regression appears.
 - Deterministic metrics run with `RunRequest.Judge = nil`.
 
-## Remaining Boundary
+## Trace Smoke Boundary
 
-This example intentionally keeps trace smoke and the final design document for later phases. Those remaining items are recorded in `phase1Pending` in the report.
+Trace smoke uses `data/promptiter-regression-loop-app/trace_smoke.evalset.json` with `evalMode: "trace"`. The evaluation service replays recorded actual invocations and their execution traces, so runner inference is skipped. The report records `traceSmoke.optimizationSkipped=true` and the reason `trace mode replays actual output and cannot validate candidate inference`.
+
+Trace smoke is useful for checking evalset compatibility, deterministic metrics, trace propagation, and failure attribution. It is not evidence that a prompt patch changes future candidate inference, so the fake mode remains the optimization acceptance path.

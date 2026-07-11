@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	modeFlag      = flag.String("mode", defaultMode, "Pipeline mode. Phase 3 supports only fake.")
+	modeFlag      = flag.String("mode", defaultMode, "Pipeline mode: fake or trace-smoke.")
 	dataDirFlag   = flag.String("data-dir", "./data", "Directory containing evalset and metrics files.")
 	outputDirFlag = flag.String("output-dir", "./output", "Directory where optimization_report.json and .md are written.")
 	promptFlag    = flag.String("prompt", "./config/baseline_prompt.txt", "Baseline prompt file.")
@@ -26,7 +26,7 @@ var (
 
 func main() {
 	flag.Parse()
-	result, err := runFakePipeline(context.Background(), pipelineConfig{
+	result, err := runPipeline(context.Background(), pipelineConfig{
 		Mode:       *modeFlag,
 		DataDir:    *dataDirFlag,
 		OutputDir:  *outputDirFlag,

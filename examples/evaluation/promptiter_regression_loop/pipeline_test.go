@@ -48,6 +48,9 @@ func TestFakePipelineRunsPromptIterEndToEnd(t *testing.T) {
 	require.NotContains(t, report.Phase1Pending, "validation_delta")
 	require.NotContains(t, report.Phase1Pending, "candidate_train_regression")
 	require.NotContains(t, report.Phase1Pending, "failure_attribution")
+	require.NotContains(t, report.Phase1Pending, "trace_smoke")
+	require.NotContains(t, report.Phase1Pending, "design_doc")
+	require.False(t, report.TraceSmoke.Enabled)
 }
 
 func TestBaselinePromptIsActuallyReadAndHashed(t *testing.T) {
@@ -152,6 +155,7 @@ func TestReportSchemaMatchesFullPlanNames(t *testing.T) {
 	require.Contains(t, decoded, "delta")
 	require.Contains(t, decoded, "attribution")
 	require.Contains(t, decoded, "gate")
+	require.Contains(t, decoded, "traceSmoke")
 	require.NotContains(t, decoded, "decision")
 	rounds := decoded["rounds"].([]any)
 	firstRound := rounds[0].(map[string]any)
@@ -391,10 +395,51 @@ func TestCandidateTrainUsesAcceptedProfileNotLastRound(t *testing.T) {
 	require.NotSame(t, rejectedProfile, report.Candidate.AcceptedProfile)
 }
 
+func TestTraceSmokePipelineRunsRecordedEvaluationOnly(t *testing.T) {
+	result, err := runPipeline(context.Background(), normalizeTestConfig(pipelineConfig{
+		Mode:      traceSmokeMode,
+		OutputDir: t.TempDir(),
+	}))
+	require.NoError(t, err)
+	require.NotNil(t, result.Report)
+	require.FileExists(t, result.ReportJSONPath)
+	require.FileExists(t, result.ReportMarkdownPath)
+
+	report := result.Report
+	require.Equal(t, traceSmokeMode, report.Mode)
+	require.True(t, report.TraceSmoke.Enabled)
+	require.True(t, report.TraceSmoke.OptimizationSkipped)
+	require.Equal(t, traceSmokeSkippedReason, report.TraceSmoke.OptimizationSkippedReason)
+	require.Equal(t, traceSmokeEvalSetID, report.TraceSmoke.EvalSetID)
+	require.Empty(t, report.Rounds)
+	require.False(t, report.Candidate.Accepted)
+	require.Empty(t, report.Gate.Decision)
+	require.Zero(t, report.Cost.ModelCallCount, "trace mode should replay recorded invocations instead of calling the model")
+	require.Zero(t, report.Cost.WorkerCallCount, "trace smoke should not call PromptIter workers")
+
+	passingCase := findCase(t, report.TraceSmoke.Evaluation, "trace_smoke_tr321_pass")
+	require.True(t, passingCase.Passed)
+	failingCase := findCase(t, report.TraceSmoke.Evaluation, "trace_smoke_tr321_argument_mismatch")
+	require.False(t, failingCase.Passed)
+	require.Contains(t, metricNames(failingCase), "tool_trajectory_avg_score")
+	require.Contains(t, metricNames(failingCase), "final_response_avg_score")
+
+	require.NotNil(t, report.TraceSmoke.Attribution)
+	byCase := indexAttributionCases(*report.TraceSmoke.Attribution)
+	failure := byCase["trace_smoke_tr321_argument_mismatch"]
+	require.Equal(t, attributionToolArgumentsMismatch, failure.Category)
+	require.Equal(t, []string{"lookup_record"}, failure.ActualToolNames)
+	require.Equal(t, []string{"lookup_record"}, failure.ExpectedToolNames)
+	require.Equal(t, "s1", failure.TerminalStepID)
+	require.Contains(t, failure.TerminalOutput, "TR000")
+	require.NotEmpty(t, failure.FailedMetrics)
+	require.Contains(t, failure.FailedMetrics[0].Reason, "mismatch")
+}
+
 func TestUnsupportedModeReturnsExplicitError(t *testing.T) {
-	_, err := runFakePipeline(context.Background(), normalizeTestConfig(pipelineConfig{Mode: "trace-smoke"}))
+	_, err := runPipeline(context.Background(), normalizeTestConfig(pipelineConfig{Mode: "unknown-mode"}))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Phase 3 supports only")
+	require.Contains(t, err.Error(), "supported modes")
 }
 
 func runTestPipeline(t *testing.T, cfg pipelineConfig) *pipelineResult {

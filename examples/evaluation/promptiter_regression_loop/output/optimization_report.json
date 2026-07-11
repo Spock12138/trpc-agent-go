@@ -937,7 +937,7 @@
           "lookup_record"
         ],
         "terminalStepId": "s2",
-        "terminalOutput": "{\"id\":\"resp_fake_flight\",\"object\":\"chat.completion\",\"created\":1783577969,\"model\":\"deterministic-flight-fake\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Lookup result for TR789: cancelled.\"},\"delta\":{\"role\":\"\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{},\"timing_info\":{}},\"timestamp\":\"0001-01-01T00:00:00Z\",\"done\":true,\"is_partial\":false}"
+        "terminalOutput": "{\"id\":\"resp_fake_flight\",\"object\":\"chat.completion\",\"created\":1783616611,\"model\":\"deterministic-flight-fake\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Lookup result for TR789: cancelled.\"},\"delta\":{\"role\":\"\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{},\"timing_info\":{}},\"timestamp\":\"0001-01-01T00:00:00Z\",\"done\":true,\"is_partial\":false}"
       }
     ],
     "summary": {
@@ -958,18 +958,18 @@
       "validation gain 0.500 meets minimum 0.050",
       "new hard fail count is 1",
       "critical regression count is 1",
-      "latency 19ms is below max 180000ms",
+      "latency 17ms is below max 180000ms",
       "fake mode cost is 0"
     ]
   },
-  "phase1Pending": [
-    "trace_smoke",
-    "design_doc"
-  ],
+  "traceSmoke": {
+    "enabled": false,
+    "optimizationSkipped": false
+  },
   "cost": {
     "totalUsd": 0,
     "modelCallCount": 30,
     "workerCallCount": 7
   },
-  "latencyMs": 19
+  "latencyMs": 17
 }

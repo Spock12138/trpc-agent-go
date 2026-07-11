@@ -31,6 +31,8 @@ const (
 	reportMarkdownName = "optimization_report.md"
 )
 
+const traceSmokeSkippedReason = "trace mode replays actual output and cannot validate candidate inference"
+
 const (
 	deltaNewPass       = "new_pass"
 	deltaNewFail       = "new_fail"
@@ -62,10 +64,7 @@ var attributionCategories = []string{
 	attributionMetricFailure,
 }
 
-var remainingPhasePending = []string{
-	"trace_smoke",
-	"design_doc",
-}
+var remainingPhasePending []string
 
 type OptimizationReport struct {
 	Mode                    string            `json:"mode"`
@@ -81,6 +80,7 @@ type OptimizationReport struct {
 	Delta                   ValidationDelta   `json:"delta"`
 	Attribution             AttributionReport `json:"attribution"`
 	Gate                    GateReport        `json:"gate"`
+	TraceSmoke              TraceSmokeReport  `json:"traceSmoke"`
 	Phase1Pending           []string          `json:"phase1Pending,omitempty"`
 	Cost                    CostSummary       `json:"cost"`
 	LatencyMs               int64             `json:"latencyMs"`
@@ -146,6 +146,15 @@ type CostSummary struct {
 	TotalUSD        float64 `json:"totalUsd"`
 	ModelCallCount  int     `json:"modelCallCount"`
 	WorkerCallCount int     `json:"workerCallCount"`
+}
+
+type TraceSmokeReport struct {
+	Enabled                   bool               `json:"enabled"`
+	EvalSetID                 string             `json:"evalSetId,omitempty"`
+	OptimizationSkipped       bool               `json:"optimizationSkipped"`
+	OptimizationSkippedReason string             `json:"optimizationSkippedReason,omitempty"`
+	Evaluation                *EvaluationSummary `json:"evaluation,omitempty"`
+	Attribution               *AttributionReport `json:"attribution,omitempty"`
 }
 
 type ValidationDelta struct {
@@ -224,6 +233,18 @@ type reportInput struct {
 	workerCallCount         int
 }
 
+type traceSmokeReportInput struct {
+	mode                    string
+	seed                    int64
+	prompt                  promptSource
+	targetSurfaceIDs        []string
+	baselineToolDescription string
+	evaluation              *promptiterengine.EvaluationResult
+	latency                 time.Duration
+	modelCallCount          int
+	workerCallCount         int
+}
+
 func buildOptimizationReport(input reportInput) (*OptimizationReport, error) {
 	if input.runResult == nil {
 		return nil, errors.New("run result is nil")
@@ -274,15 +295,47 @@ func buildOptimizationReport(input reportInput) (*OptimizationReport, error) {
 			AcceptedProfile: input.runResult.AcceptedProfile,
 			Accepted:        accepted,
 		},
-		Rounds:        summarizeRounds(input.runResult.Rounds),
-		Delta:         delta,
-		Attribution:   attribution,
-		Gate:          gate,
+		Rounds:      summarizeRounds(input.runResult.Rounds),
+		Delta:       delta,
+		Attribution: attribution,
+		Gate:        gate,
+		TraceSmoke: TraceSmokeReport{
+			Enabled: false,
+		},
 		Phase1Pending: append([]string(nil), remainingPhasePending...),
 		Cost:          cost,
 		LatencyMs:     input.latency.Milliseconds(),
 	}
 	return report, nil
+}
+
+func buildTraceSmokeOptimizationReport(input traceSmokeReportInput) *OptimizationReport {
+	attribution := buildFailureAttribution(input.evaluation)
+	evaluationSummary := summarizeEvaluationResult(input.evaluation)
+	cost := CostSummary{
+		TotalUSD:        0,
+		ModelCallCount:  input.modelCallCount,
+		WorkerCallCount: input.workerCallCount,
+	}
+	return &OptimizationReport{
+		Mode:                    input.mode,
+		Seed:                    input.seed,
+		TargetSurfaces:          append([]string(nil), input.targetSurfaceIDs...),
+		PromptSource:            input.prompt.Path,
+		PromptHash:              input.prompt.Hash,
+		PromptSummary:           input.prompt.Summary,
+		BaselineToolDescription: input.baselineToolDescription,
+		TraceSmoke: TraceSmokeReport{
+			Enabled:                   true,
+			EvalSetID:                 traceSmokeEvalSetID,
+			OptimizationSkipped:       true,
+			OptimizationSkippedReason: traceSmokeSkippedReason,
+			Evaluation:                evaluationSummary,
+			Attribution:               &attribution,
+		},
+		Cost:      cost,
+		LatencyMs: input.latency.Milliseconds(),
+	}
 }
 
 func acceptedValidation(result *promptiterengine.RunResult) (*promptiterengine.EvaluationResult, bool) {
@@ -966,6 +1019,9 @@ func writeOptimizationReport(outputDir string, report *OptimizationReport) (stri
 }
 
 func renderMarkdownReport(report *OptimizationReport) string {
+	if report.TraceSmoke.Enabled {
+		return renderTraceSmokeMarkdownReport(report)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# PromptIter Regression Loop Report\n\n")
 	fmt.Fprintf(&b, "- Mode: `%s`\n", report.Mode)
@@ -1029,9 +1085,51 @@ func renderMarkdownReport(report *OptimizationReport) string {
 			fmt.Fprintf(&b, "  - Patch `%s`: %s\n", patch.SurfaceID, patch.ToolDescription)
 		}
 	}
-	fmt.Fprintf(&b, "\n## Remaining Work\n\n")
-	for _, pending := range report.Phase1Pending {
-		fmt.Fprintf(&b, "- `%s`\n", pending)
+	if len(report.Phase1Pending) > 0 {
+		fmt.Fprintf(&b, "\n## Remaining Work\n\n")
+		for _, pending := range report.Phase1Pending {
+			fmt.Fprintf(&b, "- `%s`\n", pending)
+		}
+	}
+	return b.String()
+}
+
+func renderTraceSmokeMarkdownReport(report *OptimizationReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# PromptIter Regression Loop Trace Smoke Report\n\n")
+	fmt.Fprintf(&b, "- Mode: `%s`\n", report.Mode)
+	fmt.Fprintf(&b, "- Prompt: `%s`\n", report.PromptSource)
+	fmt.Fprintf(&b, "- Prompt hash: `%s`\n", report.PromptHash)
+	fmt.Fprintf(&b, "- Target surfaces: `%s`\n", strings.Join(report.TargetSurfaces, "`, `"))
+	fmt.Fprintf(&b, "- Trace eval set: `%s`\n", report.TraceSmoke.EvalSetID)
+	fmt.Fprintf(&b, "- Trace evaluation score: %.3f\n", scoreOf(report.TraceSmoke.Evaluation))
+	fmt.Fprintf(&b, "- Optimization skipped: %t\n", report.TraceSmoke.OptimizationSkipped)
+	fmt.Fprintf(&b, "- Skip reason: %s\n\n", report.TraceSmoke.OptimizationSkippedReason)
+	fmt.Fprintf(&b, "## Trace Smoke Evaluation\n\n")
+	if report.TraceSmoke.Evaluation == nil {
+		fmt.Fprintf(&b, "- no trace smoke evaluation result\n\n")
+	} else {
+		for _, evalSet := range report.TraceSmoke.Evaluation.EvalSets {
+			fmt.Fprintf(&b, "- Eval set `%s`: score %.3f\n", evalSet.EvalSetID, evalSet.Score)
+			for _, evalCase := range evalSet.Cases {
+				fmt.Fprintf(&b, "  - Case `%s`: score %.3f passed=%t\n", evalCase.EvalCaseID, evalCase.Score, evalCase.Passed)
+			}
+		}
+		fmt.Fprintf(&b, "\n")
+	}
+	fmt.Fprintf(&b, "## Failure Attribution\n\n")
+	if report.TraceSmoke.Attribution == nil || len(report.TraceSmoke.Attribution.PerFailedCase) == 0 {
+		fmt.Fprintf(&b, "- no failed trace smoke cases\n")
+	} else {
+		for _, failure := range report.TraceSmoke.Attribution.PerFailedCase {
+			fmt.Fprintf(
+				&b,
+				"- `%s`: `%s` - %s\n",
+				failure.EvalCaseID,
+				failure.Category,
+				strings.TrimSpace(failure.Explanation),
+			)
+		}
 	}
 	return b.String()
 }

@@ -1,0 +1,188 @@
+{
+  "evalSetId": "trace_smoke",
+  "name": "trace_smoke",
+  "evalCases": [
+    {
+      "evalId": "trace_smoke_tr321_pass",
+      "evalMode": "trace",
+      "conversation": [
+        {
+          "invocationId": "trace_smoke_tr321_pass-expected",
+          "userContent": {
+            "role": "user",
+            "content": "What is the current delay for TR321?"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "Flight TR321 is delayed by 20 minutes and is estimated to depart at 14:40 from gate C03."
+          },
+          "tools": [
+            {
+              "id": "call_trace_tr321_expected",
+              "name": "lookup_record",
+              "arguments": {
+                "query": "TR321"
+              },
+              "result": {
+                "recordId": "TR321",
+                "state": "delayed",
+                "minutes": 20,
+                "location": "C03",
+                "scheduled": "14:20",
+                "updated": "14:40"
+              }
+            }
+          ]
+        }
+      ],
+      "actualConversation": [
+        {
+          "invocationId": "trace_smoke_tr321_pass-actual",
+          "userContent": {
+            "role": "user",
+            "content": "What is the current delay for TR321?"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "Flight TR321 is delayed by 20 minutes and is estimated to depart at 14:40 from gate C03."
+          },
+          "tools": [
+            {
+              "id": "call_trace_tr321_actual",
+              "name": "lookup_record",
+              "arguments": {
+                "query": "TR321"
+              },
+              "result": {
+                "recordId": "TR321",
+                "state": "delayed",
+                "minutes": 20,
+                "location": "C03",
+                "scheduled": "14:20",
+                "updated": "14:40"
+              }
+            }
+          ],
+          "executionTrace": {
+            "RootAgentName": "candidate",
+            "RootInvocationID": "trace_smoke_tr321_pass-actual",
+            "SessionID": "trace-smoke-session-pass",
+            "Status": "completed",
+            "Steps": [
+              {
+                "StepID": "s1",
+                "InvocationID": "trace_smoke_tr321_pass-actual",
+                "AgentName": "candidate",
+                "NodeID": "candidate",
+                "AppliedSurfaceIDs": [
+                  "candidate#tool.lookup_record"
+                ],
+                "Input": {
+                  "Text": "What is the current delay for TR321?"
+                },
+                "Output": {
+                  "Text": "Flight TR321 is delayed by 20 minutes and is estimated to depart at 14:40 from gate C03."
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "sessionInput": {
+        "appName": "promptiter-regression-loop-app",
+        "userId": "demo-user"
+      }
+    },
+    {
+      "evalId": "trace_smoke_tr321_argument_mismatch",
+      "evalMode": "trace",
+      "conversation": [
+        {
+          "invocationId": "trace_smoke_tr321_argument_mismatch-expected",
+          "userContent": {
+            "role": "user",
+            "content": "What is the current delay for TR321?"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "Flight TR321 is delayed by 20 minutes and is estimated to depart at 14:40 from gate C03."
+          },
+          "tools": [
+            {
+              "id": "call_trace_mismatch_expected",
+              "name": "lookup_record",
+              "arguments": {
+                "query": "TR321"
+              },
+              "result": {
+                "recordId": "TR321",
+                "state": "delayed",
+                "minutes": 20,
+                "location": "C03",
+                "scheduled": "14:20",
+                "updated": "14:40"
+              }
+            }
+          ]
+        }
+      ],
+      "actualConversation": [
+        {
+          "invocationId": "trace_smoke_tr321_argument_mismatch-actual",
+          "userContent": {
+            "role": "user",
+            "content": "What is the current delay for TR321?"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "Lookup result for TR000: unknown."
+          },
+          "tools": [
+            {
+              "id": "call_trace_mismatch_actual",
+              "name": "lookup_record",
+              "arguments": {
+                "query": "TR000"
+              },
+              "result": {
+                "recordId": "TR000",
+                "state": "unknown",
+                "minutes": 0,
+                "location": "",
+                "scheduled": "",
+                "updated": ""
+              }
+            }
+          ],
+          "executionTrace": {
+            "RootAgentName": "candidate",
+            "RootInvocationID": "trace_smoke_tr321_argument_mismatch-actual",
+            "SessionID": "trace-smoke-session-mismatch",
+            "Status": "completed",
+            "Steps": [
+              {
+                "StepID": "s1",
+                "InvocationID": "trace_smoke_tr321_argument_mismatch-actual",
+                "AgentName": "candidate",
+                "NodeID": "candidate",
+                "AppliedSurfaceIDs": [
+                  "candidate#tool.lookup_record"
+                ],
+                "Input": {
+                  "Text": "What is the current delay for TR321?"
+                },
+                "Output": {
+                  "Text": "Lookup result for TR000: unknown."
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "sessionInput": {
+        "appName": "promptiter-regression-loop-app",
+        "userId": "demo-user"
+      }
+    }
+  ]
+}
