@@ -2,6 +2,8 @@
 
 回放一致性测试用于验证同一组 session、memory、summary 和 track 操作在不同后端上的持久化结果是否一致。当前轻量矩阵只覆盖 `InMemory` 与 `SQLite`，不依赖外部服务，适合作为本地开发和 PR 检查中的快速回归。
 
+可复用的 case、runner、snapshot、normalize、compare 和 report 编码位于 `session/replaytest`。`test/replay_consistency_test.go` 只负责 InMemory/SQLite wiring、具体 cases、故障注入和断言，因此新增后端可以复用同一执行与比较逻辑，而不必复制 e2e 测试实现。
+
 ## 运行方式
 
 在仓库根目录下运行 targeted 测试：
@@ -104,10 +106,13 @@ track 比较重点：
 测试框架包含三类异常注入：
 
 - snapshot mutation：partial event loss、summary loss、wrong session attribution、wrong summary filter key、large JSON-number drift、state byte representation drift、track payload drift、embedded track drift、track order drift
-- SQLite/public API injection：duplicate event、state pollution、memory pollution、summary overwrite
-- SQLite/storage injection：直接注入 duplicate memory row，用于模拟 backend retry bug 或 duplicate retry effect，并验证它会被报告为 unallowed memory diff
+- 执行中 retry：fail-before-write 使用相同输入重试后必须与单次成功 baseline 一致；ambiguous fail-after-write 验证 Memory Add、state update 和 summary overwrite 的幂等结果
+- SQLite/public API injection：state pollution、memory pollution、summary overwrite
+- SQLite/storage injection：直接注入 duplicate memory row，用于模拟存储损坏，并验证它会被报告为 unallowed memory diff
 
 这些异常默认都必须产生 unallowed diff。正常 replay matrix 的误报必须为 0。
+
+当前 `AppendEvent` 没有按 event ID 去重。测试会真实模拟“首次已经写入但返回错误，随后重试相同 event”，并要求重复 event 在 index 1 的错位内容和 index 2 的额外尾部位置被报告为 unallowed diff。该测试验证 harness 的诊断能力，不改变 Session 后端的运行时幂等语义。
 
 ## allowed_diff
 

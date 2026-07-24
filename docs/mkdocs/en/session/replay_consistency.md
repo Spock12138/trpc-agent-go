@@ -2,6 +2,8 @@
 
 Replay consistency tests verify that the same session, memory, summary, and track operations produce equivalent persisted results across backends. The current lightweight matrix only covers `InMemory` and `SQLite`, so it does not require external services and is suitable for local development and PR checks.
 
+Reusable case, runner, snapshot, normalization, comparison, and report-encoding logic lives in `session/replaytest`. `test/replay_consistency_test.go` retains only InMemory/SQLite wiring, concrete cases, fault injection, and assertions, so another backend can reuse the same execution and comparison logic without copying the e2e implementation.
+
 ## Running
 
 Run the targeted tests from the repository root:
@@ -104,10 +106,13 @@ Note that `AppendTrackEvent` maintains `state["tracks"]`. When debugging track d
 The test harness includes three kinds of anomaly injection:
 
 - snapshot mutation: partial event loss, summary loss, wrong session attribution, wrong summary filter key, large JSON-number drift, state byte representation drift, track payload drift, embedded track drift, and track order drift
-- SQLite/public API injection: duplicate event, state pollution, memory pollution, and summary overwrite
-- SQLite/storage injection: a duplicate memory row that simulates a backend retry bug or duplicate retry effect and verifies that it is reported as an unallowed memory diff
+- in-execution retry: fail-before-write must converge to the single-success baseline when retried with identical input; ambiguous fail-after-write verifies idempotent Memory Add, state update, and summary overwrite results
+- SQLite/public API injection: state pollution, memory pollution, and summary overwrite
+- SQLite/storage injection: a duplicate memory row that simulates storage corruption and verifies that it is reported as an unallowed memory diff
 
 Injected anomalies must produce unallowed diffs by default. The normal replay matrix must have zero false positives.
+
+`AppendEvent` currently does not deduplicate by event ID. The retry test therefore models a successful first write whose response fails, retries the identical event, and requires the shifted event at index 1 and the extra tail event at index 2 to be reported as unallowed diffs. This validates harness diagnostics without changing runtime Session idempotency semantics.
 
 ## allowed_diff
 

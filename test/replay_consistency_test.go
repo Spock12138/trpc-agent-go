@@ -10,23 +10,18 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
@@ -37,6 +32,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessinmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/session/replaytest"
 	sesssqlite "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
 	sessionsummary "trpc.group/trpc-go/trpc-agent-go/session/summary"
 )
@@ -51,87 +47,17 @@ type backendBundle struct {
 	summarizer        *deterministicSummarizer
 }
 
-type replaySnapshot struct {
-	Session replaySessionSnapshot   `json:"session"`
-	Events  []replayEventSnapshot   `json:"events"`
-	State   map[string]any          `json:"state"`
-	Memory  []replayMemorySnapshot  `json:"memory"`
-	Summary map[string]summaryEntry `json:"summary"`
-	Tracks  []trackSnapshot         `json:"tracks"`
-}
-
-type replaySessionSnapshot struct {
-	ID     string `json:"id"`
-	App    string `json:"app"`
-	UserID string `json:"user_id"`
-}
-
-type replayEventSnapshot map[string]any
-
-type replayMemorySnapshot struct {
-	Key          string   `json:"-"`
-	RawID        string   `json:"-"`
-	App          string   `json:"app"`
-	UserID       string   `json:"user_id"`
-	Content      string   `json:"content,omitempty"`
-	Topics       []string `json:"topics,omitempty"`
-	Kind         string   `json:"kind,omitempty"`
-	EventTime    string   `json:"event_time,omitempty"`
-	Participants []string `json:"participants,omitempty"`
-	Location     string   `json:"location,omitempty"`
-}
-
-type summaryEntry struct {
-	Summary          string           `json:"summary"`
-	Topics           []string         `json:"topics,omitempty"`
-	UpdatedAtNonZero bool             `json:"updated_at_non_zero"`
-	Boundary         *summaryBoundary `json:"boundary,omitempty"`
-}
-
-type summaryBoundary struct {
-	Version        int    `json:"version"`
-	FilterKey      string `json:"filter_key"`
-	CutoffAt       string `json:"cutoff_at,omitempty"`
-	LastEventIndex *int   `json:"last_event_index,omitempty"`
-}
-
-type trackSnapshot struct {
-	Name   string               `json:"name"`
-	Events []trackEventSnapshot `json:"events"`
-}
-
-type trackEventSnapshot struct {
-	Track     string `json:"track,omitempty"`
-	Payload   any    `json:"payload,omitempty"`
-	Timestamp string `json:"timestamp,omitempty"`
-}
-
-type replayStateBytesSnapshot struct {
-	Kind  string `json:"kind"`
-	Value any    `json:"value,omitempty"`
-}
-
-type diffEntry struct {
-	Case      string         `json:"case"`
-	SessionID string         `json:"session_id"`
-	BackendA  string         `json:"backend_a"`
-	BackendB  string         `json:"backend_b"`
-	Section   string         `json:"section"`
-	Path      string         `json:"path"`
-	Left      any            `json:"left"`
-	Right     any            `json:"right"`
-	Allowed   bool           `json:"allowed"`
-	Reason    string         `json:"reason"`
-	Context   map[string]any `json:"context"`
-}
-
-type allowedDiffRule struct {
-	Section  string `json:"section"`
-	Path     string `json:"path"`
-	BackendA string `json:"backend_a"`
-	BackendB string `json:"backend_b"`
-	Reason   string `json:"reason"`
-}
+type replaySnapshot = replaytest.Snapshot
+type replaySessionSnapshot = replaytest.SessionSnapshot
+type replayEventSnapshot = replaytest.EventSnapshot
+type replayMemorySnapshot = replaytest.MemorySnapshot
+type summaryEntry = replaytest.SummaryEntry
+type summaryBoundary = replaytest.SummaryBoundary
+type trackSnapshot = replaytest.TrackSnapshot
+type trackEventSnapshot = replaytest.TrackEventSnapshot
+type replayStateBytesSnapshot = replaytest.StateBytesSnapshot
+type diffEntry = replaytest.Diff
+type allowedDiffRule = replaytest.AllowedDiffRule
 
 type replayCase struct {
 	name               string
@@ -199,6 +125,61 @@ type replayCaseResult struct {
 }
 
 type replayBackendInjection func(t *testing.T, ctx context.Context, backend backendBundle, key session.Key)
+
+type replayFailOperation string
+
+const (
+	replayFailAppendEvent        replayFailOperation = "append_event"
+	replayFailUpdateSessionState replayFailOperation = "update_session_state"
+	replayFailAddMemory          replayFailOperation = "add_memory"
+	replayFailCreateSummary      replayFailOperation = "create_summary"
+)
+
+type replayFailBoundary string
+
+const (
+	replayFailBeforeWrite replayFailBoundary = "before_write"
+	replayFailAfterWrite  replayFailBoundary = "after_write"
+)
+
+type replayFailSpec struct {
+	operation  replayFailOperation
+	boundary   replayFailBoundary
+	occurrence int
+}
+
+type replayFailStats struct {
+	triggered             int
+	injectedErrors        int
+	retries               int
+	targetUnderlyingCalls int
+}
+
+type replayFailOnce struct {
+	mu              sync.Mutex
+	spec            replayFailSpec
+	seenOccurrences int
+	retryPending    bool
+	stats           replayFailStats
+}
+
+type replayRetrySessionService struct {
+	session.Service
+	fault *replayFailOnce
+}
+
+type replayRetryMemoryService struct {
+	memory.Service
+	fault *replayFailOnce
+}
+
+type replayRetryComparison struct {
+	backend  string
+	baseline replayCaseResult
+	retry    replayCaseResult
+	diffs    []diffEntry
+	stats    replayFailStats
+}
 
 var replayBaseTime = time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
 
@@ -304,293 +285,11 @@ func closeReplayBackends(t *testing.T, backends []backendBundle) {
 }
 
 func makeReplaySnapshot(sess *session.Session, memories []*memory.Entry) replaySnapshot {
-	if sess == nil {
-		return replaySnapshot{
-			State:   map[string]any{},
-			Memory:  []replayMemorySnapshot{},
-			Summary: map[string]summaryEntry{},
-			Tracks:  []trackSnapshot{},
-		}
-	}
-
-	events := sess.GetEvents()
-	return replaySnapshot{
-		Session: replaySessionSnapshot{
-			ID:     sess.ID,
-			App:    sess.AppName,
-			UserID: sess.UserID,
-		},
-		Events:  normalizeReplayEvents(events),
-		State:   normalizeReplayState(sess.SnapshotState()),
-		Memory:  normalizeReplayMemories(memories),
-		Summary: normalizeReplaySummaries(cloneReplaySummaries(sess), events),
-		Tracks:  normalizeReplayTracks(cloneReplayTracks(sess)),
-	}
-}
-
-func cloneReplaySummaries(sess *session.Session) map[string]*session.Summary {
-	if sess == nil {
-		return nil
-	}
-	sess.SummariesMu.RLock()
-	defer sess.SummariesMu.RUnlock()
-	if len(sess.Summaries) == 0 {
-		return nil
-	}
-	out := make(map[string]*session.Summary, len(sess.Summaries))
-	for key, summary := range sess.Summaries {
-		out[key] = summary.Clone()
-	}
-	return out
-}
-
-func cloneReplayTracks(sess *session.Session) map[session.Track]*session.TrackEvents {
-	if sess == nil {
-		return nil
-	}
-	sess.TracksMu.RLock()
-	defer sess.TracksMu.RUnlock()
-	if len(sess.Tracks) == 0 {
-		return nil
-	}
-	out := make(map[session.Track]*session.TrackEvents, len(sess.Tracks))
-	for track, events := range sess.Tracks {
-		copied := &session.TrackEvents{Track: track}
-		if events != nil {
-			copied.Track = events.Track
-			copied.Events = append([]session.TrackEvent(nil), events.Events...)
-		}
-		out[track] = copied
-	}
-	return out
-}
-
-func normalizeReplayEvents(events []event.Event) []replayEventSnapshot {
-	out := make([]replayEventSnapshot, 0, len(events))
-	for _, evt := range events {
-		encoded, err := json.Marshal(evt)
-		if err != nil {
-			panic(fmt.Sprintf("marshal replay event: %v", err))
-		}
-		var normalized map[string]any
-		if err := decodeReplayJSON(encoded, &normalized); err != nil {
-			panic(fmt.Sprintf("unmarshal replay event: %v", err))
-		}
-		delete(normalized, "id")
-		delete(normalized, "timestamp")
-		delete(normalized, "created")
-		if response, ok := normalized["response"].(map[string]any); ok {
-			delete(response, "id")
-			delete(response, "timestamp")
-			if len(response) == 0 {
-				delete(normalized, "response")
-			}
-		}
-		if evt.StateDelta != nil {
-			normalized["stateDelta"] = normalizeReplayState(session.StateMap(evt.StateDelta))
-		}
-		out = append(out, replayEventSnapshot(normalized))
-	}
-	return out
+	return replaytest.BuildSnapshot(sess, memories)
 }
 
 func normalizeReplayState(state session.StateMap) map[string]any {
-	out := make(map[string]any, len(state))
-	for key, value := range state {
-		out[key] = normalizeReplayBytes(value)
-	}
-	return out
-}
-
-func normalizeReplayBytes(value []byte) any {
-	if value == nil {
-		return replayStateBytesSnapshot{Kind: "nil"}
-	}
-	trimmed := bytes.TrimSpace(value)
-	if len(trimmed) > 0 {
-		var decoded any
-		if err := decodeReplayJSON(trimmed, &decoded); err == nil {
-			return replayStateBytesSnapshot{
-				Kind:  "json",
-				Value: canonicalReplayJSON(decoded),
-			}
-		}
-	}
-	if utf8.Valid(value) {
-		return replayStateBytesSnapshot{
-			Kind:  "utf8",
-			Value: string(value),
-		}
-	}
-	return replayStateBytesSnapshot{
-		Kind:  "base64",
-		Value: base64.StdEncoding.EncodeToString(value),
-	}
-}
-
-func normalizeReplayRawJSON(value json.RawMessage) any {
-	if len(value) == 0 {
-		return nil
-	}
-	var decoded any
-	if err := decodeReplayJSON(value, &decoded); err == nil {
-		return canonicalReplayJSON(decoded)
-	}
-	return normalizeReplayBytes(value)
-}
-
-func decodeReplayJSON(data []byte, out any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(out); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("unexpected trailing JSON value")
-		}
-		return fmt.Errorf("decode trailing JSON value: %w", err)
-	}
-	return nil
-}
-
-func canonicalReplayJSON(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, value := range typed {
-			out[key] = canonicalReplayJSON(value)
-		}
-		return out
-	case []any:
-		out := make([]any, len(typed))
-		for i, value := range typed {
-			out[i] = canonicalReplayJSON(value)
-		}
-		return out
-	case json.Number:
-		return json.Number(typed.String())
-	default:
-		return value
-	}
-}
-
-func normalizeReplayMemories(entries []*memory.Entry) []replayMemorySnapshot {
-	out := make([]replayMemorySnapshot, 0, len(entries))
-	for _, entry := range entries {
-		if entry == nil {
-			continue
-		}
-		snapshot := replayMemorySnapshot{
-			RawID:  entry.ID,
-			App:    entry.AppName,
-			UserID: entry.UserID,
-		}
-		if entry.Memory != nil {
-			snapshot.Content = entry.Memory.Memory
-			snapshot.Topics = sortedReplayStrings(entry.Memory.Topics)
-			snapshot.Kind = string(entry.Memory.Kind)
-			snapshot.EventTime = normalizeReplayTimePtr(entry.Memory.EventTime)
-			snapshot.Participants = sortedReplayStrings(entry.Memory.Participants)
-			snapshot.Location = entry.Memory.Location
-		}
-		snapshot.Key = replayMemoryKey(snapshot)
-		out = append(out, snapshot)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Key < out[j].Key
-	})
-	return out
-}
-
-func replayMemoryKey(snapshot replayMemorySnapshot) string {
-	encoded, err := json.Marshal(snapshot)
-	if err != nil {
-		panic(fmt.Sprintf("marshal replay memory key: %v", err))
-	}
-	return string(encoded)
-}
-
-func normalizeReplaySummaries(summaries map[string]*session.Summary, events []event.Event) map[string]summaryEntry {
-	out := make(map[string]summaryEntry, len(summaries))
-	for filterKey, summary := range summaries {
-		if summary == nil {
-			continue
-		}
-		entry := summaryEntry{
-			Summary:          summary.Summary,
-			Topics:           sortedReplayStrings(summary.Topics),
-			UpdatedAtNonZero: !summary.UpdatedAt.IsZero(),
-		}
-		if boundary := summary.CutoffBoundary(); boundary != nil {
-			entry.Boundary = &summaryBoundary{
-				Version:        boundary.Version,
-				FilterKey:      boundary.FilterKey,
-				CutoffAt:       normalizeReplayTime(boundary.CutoffAt),
-				LastEventIndex: replaySummaryLastEventIndex(events, boundary.LastEventID),
-			}
-		}
-		out[filterKey] = entry
-	}
-	return out
-}
-
-func replaySummaryLastEventIndex(events []event.Event, lastEventID string) *int {
-	if lastEventID == "" {
-		return nil
-	}
-	for i, evt := range events {
-		if evt.ID == lastEventID {
-			index := i
-			return &index
-		}
-	}
-	// -1 means the boundary had a non-empty LastEventID that could not be
-	// mapped to the current snapshot event list.
-	unmatched := -1
-	return &unmatched
-}
-
-func normalizeReplayTracks(tracks map[session.Track]*session.TrackEvents) []trackSnapshot {
-	names := make([]string, 0, len(tracks))
-	for track := range tracks {
-		names = append(names, string(track))
-	}
-	sort.Strings(names)
-
-	out := make([]trackSnapshot, 0, len(names))
-	for _, name := range names {
-		events := tracks[session.Track(name)]
-		snapshot := trackSnapshot{Name: name}
-		if events != nil {
-			for _, evt := range events.Events {
-				snapshot.Events = append(snapshot.Events, trackEventSnapshot{
-					Track:     string(evt.Track),
-					Payload:   normalizeReplayRawJSON(evt.Payload),
-					Timestamp: normalizeReplayTime(evt.Timestamp),
-				})
-			}
-		}
-		out = append(out, snapshot)
-	}
-	return out
-}
-
-func sortedReplayStrings(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	out := append([]string(nil), values...)
-	sort.Strings(out)
-	return out
-}
-
-func normalizeReplayTimePtr(value *time.Time) string {
-	if value == nil {
-		return ""
-	}
-	return normalizeReplayTime(*value)
+	return replaytest.BuildSnapshot(&session.Session{State: cloneReplayStateMap(state)}, nil).State
 }
 
 func normalizeReplayTime(value time.Time) string {
@@ -598,12 +297,6 @@ func normalizeReplayTime(value time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339Nano)
-}
-
-type replayValueDiff struct {
-	Path  string
-	Left  any
-	Right any
 }
 
 func diffReplaySnapshots(
@@ -615,349 +308,15 @@ func diffReplaySnapshots(
 	right replaySnapshot,
 	allowedRules []allowedDiffRule,
 ) []diffEntry {
-	sections := []struct {
-		name  string
-		path  string
-		left  any
-		right any
-	}{
-		{name: "session", path: "$.session", left: left.Session, right: right.Session},
-		{name: "events", path: "$.events", left: left.Events, right: right.Events},
-		{name: "state", path: "$.state", left: left.State, right: right.State},
-		{name: "memory", path: "$.memory", left: left.Memory, right: right.Memory},
-		{name: "summary", path: "$.summary", left: left.Summary, right: right.Summary},
-		{name: "tracks", path: "$.tracks", left: left.Tracks, right: right.Tracks},
-	}
-
-	var entries []diffEntry
-	for _, section := range sections {
-		valueDiffs := recursiveReplayDiff(
-			section.path,
-			replayJSONValue(section.left),
-			replayJSONValue(section.right),
-		)
-		for _, valueDiff := range valueDiffs {
-			entries = append(entries, diffEntry{
-				Case:      caseName,
-				SessionID: sessionID,
-				BackendA:  backendA,
-				BackendB:  backendB,
-				Section:   section.name,
-				Path:      valueDiff.Path,
-				Left:      valueDiff.Left,
-				Right:     valueDiff.Right,
-				Context: replayDiffContext(
-					section.name,
-					valueDiff.Path,
-					left,
-					right,
-				),
-			})
-		}
-	}
-	applyReplayAllowedDiffRules(entries, allowedRules)
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].Section != entries[j].Section {
-			return entries[i].Section < entries[j].Section
-		}
-		return entries[i].Path < entries[j].Path
-	})
-	return entries
-}
-
-func replayJSONValue(value any) any {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		panic(fmt.Sprintf("marshal replay diff value: %v", err))
-	}
-	var out any
-	if err := decodeReplayJSON(encoded, &out); err != nil {
-		panic(fmt.Sprintf("unmarshal replay diff value: %v", err))
-	}
-	return canonicalReplayJSON(out)
-}
-
-func recursiveReplayDiff(path string, left any, right any) []replayValueDiff {
-	if reflect.DeepEqual(left, right) {
-		return nil
-	}
-
-	leftMap, leftIsMap := left.(map[string]any)
-	rightMap, rightIsMap := right.(map[string]any)
-	if leftIsMap && rightIsMap {
-		return recursiveReplayMapDiff(path, leftMap, rightMap)
-	}
-
-	leftList, leftIsList := left.([]any)
-	rightList, rightIsList := right.([]any)
-	if leftIsList && rightIsList {
-		return recursiveReplayListDiff(path, leftList, rightList)
-	}
-
-	return []replayValueDiff{{
-		Path:  path,
-		Left:  left,
-		Right: right,
-	}}
-}
-
-func recursiveReplayMapDiff(path string, left map[string]any, right map[string]any) []replayValueDiff {
-	keys := make([]string, 0, len(left)+len(right))
-	seen := make(map[string]struct{}, len(left)+len(right))
-	for key := range left {
-		keys = append(keys, key)
-		seen[key] = struct{}{}
-	}
-	for key := range right {
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var diffs []replayValueDiff
-	for _, key := range keys {
-		childPath := appendReplayPath(path, key)
-		leftValue, leftOK := left[key]
-		rightValue, rightOK := right[key]
-		switch {
-		case !leftOK:
-			diffs = append(diffs, replayValueDiff{
-				Path:  childPath,
-				Left:  replayMissingValue(),
-				Right: rightValue,
-			})
-		case !rightOK:
-			diffs = append(diffs, replayValueDiff{
-				Path:  childPath,
-				Left:  leftValue,
-				Right: replayMissingValue(),
-			})
-		default:
-			diffs = append(diffs, recursiveReplayDiff(childPath, leftValue, rightValue)...)
-		}
-	}
-	return diffs
-}
-
-func recursiveReplayListDiff(path string, left []any, right []any) []replayValueDiff {
-	maxLen := len(left)
-	if len(right) > maxLen {
-		maxLen = len(right)
-	}
-	var diffs []replayValueDiff
-	for i := 0; i < maxLen; i++ {
-		childPath := fmt.Sprintf("%s[%d]", path, i)
-		switch {
-		case i >= len(left):
-			diffs = append(diffs, replayValueDiff{
-				Path:  childPath,
-				Left:  replayMissingValue(),
-				Right: right[i],
-			})
-		case i >= len(right):
-			diffs = append(diffs, replayValueDiff{
-				Path:  childPath,
-				Left:  left[i],
-				Right: replayMissingValue(),
-			})
-		default:
-			diffs = append(diffs, recursiveReplayDiff(childPath, left[i], right[i])...)
-		}
-	}
-	return diffs
-}
-
-func replayMissingValue() map[string]string {
-	return map[string]string{"replay": "missing"}
-}
-
-func appendReplayPath(path string, key string) string {
-	if isReplayPathIdent(key) {
-		return path + "." + key
-	}
-	quoted, err := json.Marshal(key)
-	if err != nil {
-		panic(fmt.Sprintf("quote replay path key: %v", err))
-	}
-	return path + "[" + string(quoted) + "]"
-}
-
-func isReplayPathIdent(key string) bool {
-	if key == "" {
-		return false
-	}
-	for i, r := range key {
-		if i == 0 {
-			if r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' {
-				continue
-			}
-			return false
-		}
-		if r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func replayDiffContext(section string, path string, left replaySnapshot, right replaySnapshot) map[string]any {
-	context := map[string]any{}
-	switch section {
-	case "events":
-		if index, ok := replayPathIndex(path, "$.events"); ok {
-			context["event_index"] = index
-		}
-	case "memory":
-		if index, ok := replayPathIndex(path, "$.memory"); ok {
-			if index < len(left.Memory) {
-				context["memory_key"] = left.Memory[index].Key
-				context["left_memory_key"] = left.Memory[index].Key
-				context["left_memory_id"] = left.Memory[index].RawID
-			}
-			if index < len(right.Memory) {
-				if _, ok := context["memory_key"]; !ok {
-					context["memory_key"] = right.Memory[index].Key
-				}
-				context["right_memory_key"] = right.Memory[index].Key
-				context["right_memory_id"] = right.Memory[index].RawID
-			}
-		}
-	case "summary":
-		if filterKey, ok := replaySummaryFilterKey(path); ok {
-			context["summary_filter_key"] = filterKey
-		}
-	case "tracks":
-		if index, ok := replayPathIndex(path, "$.tracks"); ok {
-			if index < len(left.Tracks) {
-				context["track_name"] = left.Tracks[index].Name
-			} else if index < len(right.Tracks) {
-				context["track_name"] = right.Tracks[index].Name
-			}
-		}
-		if index, ok := replayNestedPathIndex(path, ".events"); ok {
-			context["track_event_index"] = index
-		}
-	}
-	if len(context) == 0 {
-		return nil
-	}
-	return context
-}
-
-func replayPathIndex(path string, prefix string) (int, bool) {
-	if !strings.HasPrefix(path, prefix+"[") {
-		return 0, false
-	}
-	start := len(prefix) + 1
-	end := strings.Index(path[start:], "]")
-	if end < 0 {
-		return 0, false
-	}
-	index, err := strconv.Atoi(path[start : start+end])
-	if err != nil {
-		return 0, false
-	}
-	return index, true
-}
-
-func replayNestedPathIndex(path string, marker string) (int, bool) {
-	position := strings.Index(path, marker+"[")
-	if position < 0 {
-		return 0, false
-	}
-	start := position + len(marker) + 1
-	end := strings.Index(path[start:], "]")
-	if end < 0 {
-		return 0, false
-	}
-	index, err := strconv.Atoi(path[start : start+end])
-	if err != nil {
-		return 0, false
-	}
-	return index, true
-}
-
-func replaySummaryFilterKey(path string) (string, bool) {
-	const bracketPrefix = "$.summary["
-	if strings.HasPrefix(path, bracketPrefix) {
-		start := len(bracketPrefix)
-		end := strings.Index(path[start:], "]")
-		if end < 0 {
-			return "", false
-		}
-		quoted := path[start : start+end]
-		value, err := strconv.Unquote(quoted)
-		if err != nil {
-			return "", false
-		}
-		return value, true
-	}
-	const dotPrefix = "$.summary."
-	if !strings.HasPrefix(path, dotPrefix) {
-		return "", false
-	}
-	remaining := strings.TrimPrefix(path, dotPrefix)
-	key := remaining
-	if dot := strings.Index(key, "."); dot >= 0 {
-		key = key[:dot]
-	}
-	if bracket := strings.Index(key, "["); bracket >= 0 {
-		key = key[:bracket]
-	}
-	return key, true
-}
-
-func applyReplayAllowedDiffRules(entries []diffEntry, rules []allowedDiffRule) {
-	for i := range entries {
-		for _, rule := range rules {
-			if !rule.matchesReplayDiff(entries[i]) {
-				continue
-			}
-			entries[i].Allowed = true
-			entries[i].Reason = strings.TrimSpace(rule.Reason)
-			break
-		}
-	}
-}
-
-func (rule allowedDiffRule) matchesReplayDiff(entry diffEntry) bool {
-	section := strings.TrimSpace(rule.Section)
-	path := strings.TrimSpace(rule.Path)
-	backendA := strings.TrimSpace(rule.BackendA)
-	backendB := strings.TrimSpace(rule.BackendB)
-	reason := strings.TrimSpace(rule.Reason)
-	if section == "" || section == "*" ||
-		path == "" || !replayAllowedPathHasLiteral(path) ||
-		backendA == "" || backendA == "*" ||
-		backendB == "" || backendB == "*" ||
-		reason == "" {
-		return false
-	}
-	if section != entry.Section {
-		return false
-	}
-	if !replayWildcardMatch(path, entry.Path) {
-		return false
-	}
-	return replayBackendRuleMatches(backendA, backendB, entry.BackendA, entry.BackendB)
-}
-
-func replayAllowedPathHasLiteral(path string) bool {
-	return strings.TrimSpace(strings.ReplaceAll(path, "*", "")) != ""
-}
-
-func replayBackendRuleMatches(ruleA string, ruleB string, entryA string, entryB string) bool {
-	if replayBackendNameMatches(ruleA, entryA) && replayBackendNameMatches(ruleB, entryB) {
-		return true
-	}
-	return replayBackendNameMatches(ruleA, entryB) && replayBackendNameMatches(ruleB, entryA)
-}
-
-func replayBackendNameMatches(pattern string, value string) bool {
-	return pattern == value
+	return replaytest.CompareSnapshots(
+		caseName,
+		sessionID,
+		backendA,
+		backendB,
+		left,
+		right,
+		allowedRules,
+	)
 }
 
 func replayWildcardMatch(pattern string, value string) bool {
@@ -986,6 +345,9 @@ func replayWildcardMatch(pattern string, value string) bool {
 	return last == "" || strings.HasSuffix(value, last)
 }
 
+func replayMissingValue() map[string]string {
+	return map[string]string{"replay": "missing"}
+}
 func replayDiffReportPath() string {
 	if override := strings.TrimSpace(os.Getenv("TRPC_AGENT_REPLAY_REPORT_PATH")); override != "" {
 		return override
@@ -997,18 +359,19 @@ func writeReplayDiffReport(path string, entries []diffEntry) error {
 	if strings.TrimSpace(path) == "" {
 		path = replayDiffReportPath()
 	}
-	if entries == nil {
-		entries = []diffEntry{}
-	}
-	encoded, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal replay diff report: %w", err)
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create replay diff report dir: %w", err)
 	}
-	if err := os.WriteFile(path, append(encoded, '\n'), 0o644); err != nil {
-		return fmt.Errorf("write replay diff report: %w", err)
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create replay diff report: %w", err)
+	}
+	if err := replaytest.WriteReport(file, entries); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close replay diff report: %w", err)
 	}
 	return nil
 }
@@ -1020,87 +383,66 @@ func runReplayCaseOnBackend(
 	tc replayCase,
 ) replayCaseResult {
 	t.Helper()
-
-	key := session.Key{
-		AppName:   "replay-matrix-" + tc.name,
-		UserID:    "user-" + tc.name,
-		SessionID: "session-" + tc.name,
-	}
-	sess, err := backend.sessionService.CreateSession(
-		ctx,
-		key,
-		cloneReplayStateMap(tc.initialState),
-	)
+	result, err := replaytest.Run(ctx, toReplayTestBackend(backend), toReplayTestCase(tc))
 	require.NoError(t, err)
-	require.NotNil(t, sess)
-
-	if len(tc.appState) > 0 {
-		require.NoError(t, backend.sessionService.UpdateAppState(
-			ctx,
-			key.AppName,
-			cloneReplayStateMap(tc.appState),
-		))
-	}
-	if len(tc.userState) > 0 {
-		require.NoError(t, backend.sessionService.UpdateUserState(
-			ctx,
-			session.UserKey{AppName: key.AppName, UserID: key.UserID},
-			cloneReplayStateMap(tc.userState),
-		))
-	}
-	if len(tc.sessionState) > 0 {
-		require.NoError(t, backend.sessionService.UpdateSessionState(
-			ctx,
-			key,
-			cloneReplayStateMap(tc.sessionState),
-		))
-	}
-
-	for i, spec := range tc.events {
-		got, err := backend.sessionService.GetSession(ctx, key)
-		require.NoError(t, err)
-		require.NotNil(t, got)
-		evt := buildReplayEvent(tc.name, i, spec)
-		require.NoError(t, backend.sessionService.AppendEvent(ctx, got, evt))
-	}
-	for _, spec := range tc.tracks {
-		appendReplayTrack(t, ctx, backend, key, spec)
-	}
-
-	memoryAliases := make(map[string]string)
-	userKey := memory.UserKey{AppName: key.AppName, UserID: key.UserID}
-	for _, op := range tc.memories {
-		applyReplayMemoryOp(t, ctx, backend.memoryService, userKey, memoryAliases, op)
-	}
-	if len(tc.concurrentMemories) > 0 {
-		applyReplayMemoriesConcurrently(
-			t,
-			ctx,
-			backend.memoryService,
-			userKey,
-			tc.concurrentMemories,
-		)
-	}
-	for _, query := range tc.queries {
-		results, err := backend.memoryService.SearchMemories(ctx, userKey, query.query)
-		require.NoError(t, err)
-		require.GreaterOrEqual(t, len(results), query.minResults)
-	}
-
-	for _, spec := range tc.summaries {
-		createReplaySummary(t, ctx, backend, key, spec)
-	}
-
-	got, err := backend.sessionService.GetSession(ctx, key)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	memories, err := backend.memoryService.ReadMemories(ctx, userKey, 0)
-	require.NoError(t, err)
-
 	return replayCaseResult{
-		backend:  backend.name,
-		key:      key,
-		snapshot: makeReplaySnapshot(got, memories),
+		backend:  result.Backend,
+		key:      result.Key,
+		snapshot: result.Snapshot,
+	}
+}
+
+func toReplayTestBackend(backend backendBundle) replaytest.Backend {
+	return replaytest.Backend{
+		Name:           backend.name,
+		SessionService: backend.sessionService,
+		TrackService:   backend.trackService,
+		MemoryService:  backend.memoryService,
+		SetSummaryText: func(text string) {
+			backend.summarizer.text = text
+		},
+	}
+}
+
+func toReplayTestCase(tc replayCase) replaytest.Case {
+	events := make([]*event.Event, 0, len(tc.events))
+	for i, spec := range tc.events {
+		events = append(events, buildReplayEvent(tc.name, i, spec))
+	}
+	convertMemoryOps := func(specs []memoryOpSpec) []replaytest.MemoryOp {
+		out := make([]replaytest.MemoryOp, 0, len(specs))
+		for _, spec := range specs {
+			out = append(out, replaytest.MemoryOp{
+				Name: spec.name, Operation: replaytest.MemoryOperation(spec.op), Ref: spec.ref,
+				Content: spec.content, Topics: append([]string(nil), spec.topics...),
+				Metadata: spec.metadata, ResultAlias: spec.resultAlias,
+			})
+		}
+		return out
+	}
+	summaries := make([]replaytest.SummaryStep, 0, len(tc.summaries))
+	for _, spec := range tc.summaries {
+		summaries = append(summaries, replaytest.SummaryStep{
+			Name: spec.name, FilterKey: spec.filterKey, Force: spec.force,
+			Text: spec.text, WantText: spec.wantText,
+		})
+	}
+	tracks := make([]replaytest.TrackSpec, 0, len(tc.tracks))
+	for _, spec := range tc.tracks {
+		tracks = append(tracks, replaytest.TrackSpec{
+			Name: spec.name, Payload: spec.payload, Timestamp: spec.timestamp,
+		})
+	}
+	queries := make([]replaytest.MemoryQuery, 0, len(tc.queries))
+	for _, spec := range tc.queries {
+		queries = append(queries, replaytest.MemoryQuery{Query: spec.query, MinResults: spec.minResults})
+	}
+	return replaytest.Case{
+		Name: tc.name, InitialState: tc.initialState, AppState: tc.appState,
+		UserState: tc.userState, SessionState: tc.sessionState, Events: events,
+		ConcurrentMemories: convertMemoryOps(tc.concurrentMemories),
+		Summaries:          summaries, Tracks: tracks, Memories: convertMemoryOps(tc.memories),
+		Queries: queries, AllowedDiffs: tc.allowedDiffs,
 	}
 }
 
@@ -1185,54 +527,6 @@ INSERT INTO %s (
 	require.NoError(t, err)
 }
 
-func applyReplayMemoriesConcurrently(
-	t *testing.T,
-	ctx context.Context,
-	service memory.Service,
-	userKey memory.UserKey,
-	ops []memoryOpSpec,
-) {
-	t.Helper()
-
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(ops))
-	start := make(chan struct{})
-
-	for _, op := range ops {
-		op := op
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-
-			if op.op != "add" {
-				errCh <- fmt.Errorf("unsupported concurrent memory op %q", op.op)
-				return
-			}
-			var opts []memory.AddOption
-			if op.metadata != nil {
-				opts = append(opts, memory.WithMetadata(op.metadata))
-			}
-			if err := service.AddMemory(
-				ctx,
-				userKey,
-				op.content,
-				append([]string(nil), op.topics...),
-				opts...,
-			); err != nil {
-				errCh <- err
-			}
-		}()
-	}
-
-	close(start)
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
-}
-
 func runReplayCaseWithBackendInjection(
 	t *testing.T,
 	ctx context.Context,
@@ -1253,6 +547,172 @@ func runReplayCaseWithBackendInjection(
 		results = append(results, result)
 	}
 	return compareReplayCaseResults(tc, results)
+}
+
+var errReplayInjectedFailure = errors.New("replay injected failure")
+
+func (f *replayFailOnce) execute(operation replayFailOperation, call func() error) error {
+	f.mu.Lock()
+	if operation != f.spec.operation {
+		f.mu.Unlock()
+		return call()
+	}
+	if f.retryPending {
+		f.retryPending = false
+		f.stats.targetUnderlyingCalls++
+		f.mu.Unlock()
+		return call()
+	}
+	occurrence := f.seenOccurrences
+	f.seenOccurrences++
+	target := occurrence == f.spec.occurrence && f.stats.triggered == 0
+	if !target {
+		f.mu.Unlock()
+		return call()
+	}
+
+	switch f.spec.boundary {
+	case replayFailBeforeWrite:
+		f.stats.triggered++
+		f.stats.injectedErrors++
+		f.retryPending = true
+		f.mu.Unlock()
+		return errReplayInjectedFailure
+	case replayFailAfterWrite:
+		f.stats.targetUnderlyingCalls++
+		f.mu.Unlock()
+		if err := call(); err != nil {
+			return err
+		}
+		f.mu.Lock()
+		f.stats.triggered++
+		f.stats.injectedErrors++
+		f.retryPending = true
+		f.mu.Unlock()
+		return errReplayInjectedFailure
+	default:
+		f.mu.Unlock()
+		return fmt.Errorf("unknown replay failure boundary %q", f.spec.boundary)
+	}
+}
+
+func (f *replayFailOnce) recordRetry() {
+	f.mu.Lock()
+	f.stats.retries++
+	f.mu.Unlock()
+}
+
+func executeReplayRetry(fault *replayFailOnce, call func() error) error {
+	err := call()
+	if !errors.Is(err, errReplayInjectedFailure) {
+		return err
+	}
+	fault.recordRetry()
+	return call()
+}
+
+func (f *replayFailOnce) snapshotStats() replayFailStats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stats
+}
+
+func (s *replayRetrySessionService) AppendEvent(
+	ctx context.Context,
+	sess *session.Session,
+	evt *event.Event,
+	opts ...session.Option,
+) error {
+	return executeReplayRetry(s.fault, func() error {
+		return s.fault.execute(replayFailAppendEvent, func() error {
+			return s.Service.AppendEvent(ctx, sess, evt, opts...)
+		})
+	})
+}
+
+func (s *replayRetrySessionService) UpdateSessionState(
+	ctx context.Context,
+	key session.Key,
+	state session.StateMap,
+) error {
+	return executeReplayRetry(s.fault, func() error {
+		return s.fault.execute(replayFailUpdateSessionState, func() error {
+			return s.Service.UpdateSessionState(ctx, key, state)
+		})
+	})
+}
+
+func (s *replayRetrySessionService) CreateSessionSummary(
+	ctx context.Context,
+	sess *session.Session,
+	filterKey string,
+	force bool,
+) error {
+	return executeReplayRetry(s.fault, func() error {
+		return s.fault.execute(replayFailCreateSummary, func() error {
+			return s.Service.CreateSessionSummary(ctx, sess, filterKey, force)
+		})
+	})
+}
+
+func (s *replayRetryMemoryService) AddMemory(
+	ctx context.Context,
+	userKey memory.UserKey,
+	memoryText string,
+	topics []string,
+	opts ...memory.AddOption,
+) error {
+	return executeReplayRetry(s.fault, func() error {
+		return s.fault.execute(replayFailAddMemory, func() error {
+			return s.Service.AddMemory(ctx, userKey, memoryText, topics, opts...)
+		})
+	})
+}
+
+func wrapReplayBackendForRetry(backend backendBundle, fault *replayFailOnce) backendBundle {
+	wrappedSession := &replayRetrySessionService{Service: backend.sessionService, fault: fault}
+	wrappedMemory := &replayRetryMemoryService{Service: backend.memoryService, fault: fault}
+	backend.sessionService = wrappedSession
+	backend.memoryService = wrappedMemory
+	return backend
+}
+
+func runReplayCaseWithRetry(
+	t *testing.T,
+	ctx context.Context,
+	tc replayCase,
+	spec replayFailSpec,
+) []replayRetryComparison {
+	t.Helper()
+
+	baselineBackends := makeReplayBackends(t)
+	retryBackends := makeReplayBackends(t)
+	retryByName := make(map[string]backendBundle, len(retryBackends))
+	for _, backend := range retryBackends {
+		retryByName[backend.name] = backend
+	}
+	comparisons := make([]replayRetryComparison, 0, len(baselineBackends))
+	for _, baselineBackend := range baselineBackends {
+		retryBackend, ok := retryByName[baselineBackend.name]
+		require.Truef(t, ok, "missing retry backend %s", baselineBackend.name)
+		fault := &replayFailOnce{spec: spec}
+		baseline := runReplayCaseOnBackend(t, ctx, baselineBackend, tc)
+		retry := runReplayCaseOnBackend(t, ctx, wrapReplayBackendForRetry(retryBackend, fault), tc)
+		diffs := diffReplaySnapshots(
+			tc.name,
+			baseline.key.SessionID,
+			baseline.backend+"_baseline",
+			retry.backend+"_retry",
+			baseline.snapshot,
+			retry.snapshot,
+			nil,
+		)
+		comparisons = append(comparisons, replayRetryComparison{
+			backend: baselineBackend.name, baseline: baseline, retry: retry,
+			diffs: diffs, stats: fault.snapshotStats(),
+		})
+	}
+	return comparisons
 }
 
 func requireReplayDiff(
@@ -1410,78 +870,6 @@ func replaySpecTime(index int) time.Time {
 	return replayBaseTime.Add(time.Duration(index) * time.Second)
 }
 
-func appendReplayTrack(
-	t *testing.T,
-	ctx context.Context,
-	backend backendBundle,
-	key session.Key,
-	spec trackSpec,
-) {
-	t.Helper()
-
-	require.NotEmpty(t, spec.name, "replay track name must not be empty")
-	got, err := backend.sessionService.GetSession(ctx, key)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-
-	payload, err := json.Marshal(spec.payload)
-	require.NoError(t, err)
-	require.NoError(t, backend.trackService.AppendTrackEvent(
-		ctx,
-		got,
-		&session.TrackEvent{
-			Track:     session.Track(spec.name),
-			Payload:   payload,
-			Timestamp: spec.timestamp,
-		},
-	))
-}
-
-func createReplaySummary(
-	t *testing.T,
-	ctx context.Context,
-	backend backendBundle,
-	key session.Key,
-	spec summaryStep,
-) {
-	t.Helper()
-
-	got, err := backend.sessionService.GetSession(ctx, key)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-
-	backend.summarizer.text = spec.text
-	require.NoError(t, backend.sessionService.CreateSessionSummary(
-		ctx,
-		got,
-		spec.filterKey,
-		spec.force,
-	))
-
-	got, err = backend.sessionService.GetSession(ctx, key)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-
-	wantText := spec.wantText
-	if wantText == "" {
-		wantText = spec.text
-	}
-	var opts []session.SummaryOption
-	if spec.filterKey != session.SummaryFilterKeyAllContents {
-		opts = append(opts, session.WithSummaryFilterKey(spec.filterKey))
-	}
-	text, ok := backend.sessionService.GetSessionSummaryText(ctx, got, opts...)
-	require.Truef(t, ok, "summary step %q filterKey %q not found", spec.name, spec.filterKey)
-	require.Equalf(
-		t,
-		wantText,
-		text,
-		"summary step %q filterKey %q returned unexpected text",
-		spec.name,
-		spec.filterKey,
-	)
-}
-
 func cloneReplayEventActions(actions *event.EventActions) *event.EventActions {
 	if actions == nil {
 		return nil
@@ -1491,117 +879,18 @@ func cloneReplayEventActions(actions *event.EventActions) *event.EventActions {
 	}
 }
 
-func applyReplayMemoryOp(
-	t *testing.T,
-	ctx context.Context,
-	service memory.Service,
-	userKey memory.UserKey,
-	aliases map[string]string,
-	op memoryOpSpec,
-) {
-	t.Helper()
-
-	switch op.op {
-	case "add":
-		var opts []memory.AddOption
-		if op.metadata != nil {
-			opts = append(opts, memory.WithMetadata(op.metadata))
-		}
-		require.NoError(t, service.AddMemory(
-			ctx,
-			userKey,
-			op.content,
-			append([]string(nil), op.topics...),
-			opts...,
-		))
-		if op.resultAlias != "" {
-			aliases[op.resultAlias] = findReplayMemoryID(t, ctx, service, userKey, op.content)
-		}
-	case "update":
-		memoryID := aliases[op.ref]
-		require.NotEmpty(t, memoryID, "missing memory alias %s", op.ref)
-		var opts []memory.UpdateOption
-		if op.metadata != nil {
-			opts = append(opts, memory.WithUpdateMetadata(op.metadata))
-		}
-		result := &memory.UpdateResult{}
-		opts = append(opts, memory.WithUpdateResult(result))
-		require.NoError(t, service.UpdateMemory(
-			ctx,
-			memory.Key{
-				AppName:  userKey.AppName,
-				UserID:   userKey.UserID,
-				MemoryID: memoryID,
-			},
-			op.content,
-			append([]string(nil), op.topics...),
-			opts...,
-		))
-		if op.resultAlias != "" {
-			require.NotEmpty(t, result.MemoryID)
-			aliases[op.resultAlias] = result.MemoryID
-		}
-	case "delete":
-		memoryID := aliases[op.ref]
-		require.NotEmpty(t, memoryID, "missing memory alias %s", op.ref)
-		require.NoError(t, service.DeleteMemory(ctx, memory.Key{
-			AppName:  userKey.AppName,
-			UserID:   userKey.UserID,
-			MemoryID: memoryID,
-		}))
-	default:
-		require.Failf(t, "unknown replay memory op", "op=%s name=%s", op.op, op.name)
-	}
-}
-
-func findReplayMemoryID(
-	t *testing.T,
-	ctx context.Context,
-	service memory.Service,
-	userKey memory.UserKey,
-	content string,
-) string {
-	t.Helper()
-
-	entries, err := service.ReadMemories(ctx, userKey, 0)
-	require.NoError(t, err)
-	for _, entry := range entries {
-		if entry == nil || entry.Memory == nil {
-			continue
-		}
-		if entry.Memory.Memory == content {
-			return entry.ID
-		}
-	}
-	require.Failf(t, "memory not found", "content=%s", content)
-	return ""
-}
-
 func compareReplayCaseResults(tc replayCase, results []replayCaseResult) []diffEntry {
-	var diffs []diffEntry
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			diffs = append(diffs, diffReplaySnapshots(
-				tc.name,
-				results[i].key.SessionID,
-				results[i].backend,
-				results[j].backend,
-				results[i].snapshot,
-				results[j].snapshot,
-				tc.allowedDiffs,
-			)...)
-		}
+	converted := make([]replaytest.Result, 0, len(results))
+	for _, result := range results {
+		converted = append(converted, replaytest.Result{
+			Backend: result.backend, Key: result.key, Snapshot: result.snapshot,
+		})
 	}
-	return diffs
+	return replaytest.Compare(toReplayTestCase(tc), converted)
 }
 
 func hasReplayUnallowedDiffs(entries []diffEntry) bool {
-	for _, entry := range entries {
-		if !entry.Allowed {
-			return true
-		}
-	}
-	return false
+	return replaytest.HasUnallowedDiffs(entries)
 }
 
 func replayUserEvent(content string, opts ...func(*eventSpec)) eventSpec {
@@ -2763,6 +2052,158 @@ func TestReplayConsistencyReport_AllowedDiffAndEnvPath(t *testing.T) {
 	requireReplayReportFields(t, reportPath)
 }
 
+func requireReplayRetryStats(
+	t *testing.T,
+	stats replayFailStats,
+	boundary replayFailBoundary,
+) {
+	t.Helper()
+	require.Equal(t, 1, stats.triggered)
+	require.Equal(t, 1, stats.injectedErrors)
+	require.Equal(t, 1, stats.retries)
+	wantUnderlyingCalls := 1
+	if boundary == replayFailAfterWrite {
+		wantUnderlyingCalls = 2
+	}
+	require.Equal(t, wantUnderlyingCalls, stats.targetUnderlyingCalls)
+}
+
+func requireReplayIdempotentSection(
+	t *testing.T,
+	operation replayFailOperation,
+	baseline replaySnapshot,
+	retry replaySnapshot,
+) {
+	t.Helper()
+	switch operation {
+	case replayFailAddMemory:
+		require.Len(t, retry.Memory, len(baseline.Memory))
+		for i := range baseline.Memory {
+			want := baseline.Memory[i]
+			got := retry.Memory[i]
+			want.RawID = ""
+			got.RawID = ""
+			require.Equalf(t, want, got, "memory entry %d differs after retry", i)
+		}
+	case replayFailUpdateSessionState:
+		require.Equal(t, baseline.State, retry.State)
+	case replayFailCreateSummary:
+		require.Len(t, retry.Summary, len(baseline.Summary))
+		require.Equal(t, baseline.Summary, retry.Summary)
+	default:
+		require.Failf(t, "unsupported idempotency assertion", "operation=%s", operation)
+	}
+}
+
+func TestReplayConsistencyRetry_FailBeforeWriteClean(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		caseName  string
+		operation replayFailOperation
+	}{
+		{name: "event", caseName: "single_turn", operation: replayFailAppendEvent},
+		{name: "state", caseName: "state_scopes", operation: replayFailUpdateSessionState},
+		{name: "memory", caseName: "memory_add_update_search", operation: replayFailAddMemory},
+		{name: "summary", caseName: "full_summary", operation: replayFailCreateSummary},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			comparisons := runReplayCaseWithRetry(t, ctx, replayCaseByName(t, tt.caseName), replayFailSpec{
+				operation: tt.operation, boundary: replayFailBeforeWrite, occurrence: 0,
+			})
+			require.Len(t, comparisons, 2)
+			for _, comparison := range comparisons {
+				requireReplayRetryStats(t, comparison.stats, replayFailBeforeWrite)
+				require.Emptyf(
+					t,
+					comparison.diffs,
+					"backend %s retained data after before-write retry: %+v",
+					comparison.backend,
+					comparison.diffs,
+				)
+			}
+		})
+	}
+}
+
+func TestReplayConsistencyRetry_FailAfterWriteIdempotent(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		caseName  string
+		operation replayFailOperation
+	}{
+		{name: "memory", caseName: "memory_add_update_search", operation: replayFailAddMemory},
+		{name: "state", caseName: "state_scopes", operation: replayFailUpdateSessionState},
+		{name: "summary", caseName: "full_summary", operation: replayFailCreateSummary},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			comparisons := runReplayCaseWithRetry(t, ctx, replayCaseByName(t, tt.caseName), replayFailSpec{
+				operation: tt.operation, boundary: replayFailAfterWrite, occurrence: 0,
+			})
+			require.Len(t, comparisons, 2)
+			for _, comparison := range comparisons {
+				requireReplayRetryStats(t, comparison.stats, replayFailAfterWrite)
+				requireReplayIdempotentSection(
+					t,
+					tt.operation,
+					comparison.baseline.snapshot,
+					comparison.retry.snapshot,
+				)
+				require.Emptyf(
+					t,
+					comparison.diffs,
+					"backend %s is not idempotent for %s: %+v",
+					comparison.backend,
+					tt.operation,
+					comparison.diffs,
+				)
+			}
+		})
+	}
+}
+
+func TestReplayConsistencyRetry_DuplicateEventFailAfterWriteDetected(t *testing.T) {
+	ctx := context.Background()
+	reportPath := filepath.Join(t.TempDir(), "replay-event-retry-report.json")
+	comparisons := runReplayCaseWithRetry(t, ctx, replayCaseByName(t, "single_turn"), replayFailSpec{
+		operation: replayFailAppendEvent, boundary: replayFailAfterWrite, occurrence: 0,
+	})
+	require.Len(t, comparisons, 2)
+	var allDiffs []diffEntry
+	for _, comparison := range comparisons {
+		requireReplayRetryStats(t, comparison.stats, replayFailAfterWrite)
+		require.Len(t, comparison.baseline.snapshot.Events, 2)
+		require.Len(t, comparison.retry.snapshot.Events, 3)
+		require.Equal(t, comparison.baseline.snapshot.Events[0], comparison.retry.snapshot.Events[0])
+		require.Equal(t, comparison.retry.snapshot.Events[0], comparison.retry.snapshot.Events[1])
+		require.Equal(t, comparison.baseline.snapshot.Events[1], comparison.retry.snapshot.Events[2])
+		require.NotEmpty(t, comparison.diffs)
+		for _, diff := range comparison.diffs {
+			require.False(t, diff.Allowed)
+		}
+		requireReplayDiff(
+			t,
+			comparison.diffs,
+			"events",
+			"$.events[1]*",
+			map[string]any{"event_index": 1},
+		)
+		requireReplayDiff(
+			t,
+			comparison.diffs,
+			"events",
+			"$.events[2]*",
+			map[string]any{"event_index": 2},
+		)
+		allDiffs = append(allDiffs, comparison.diffs...)
+	}
+	require.NoError(t, writeReplayDiffReport(reportPath, allDiffs))
+	requireReplayReportFields(t, reportPath)
+}
+
 func TestReplayConsistencyAnomaly_SQLitePublicAPIInjection(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
@@ -2773,27 +2214,6 @@ func TestReplayConsistencyAnomaly_SQLitePublicAPIInjection(t *testing.T) {
 		pathGlob string
 		context  map[string]any
 	}{
-		{
-			name: "duplicate_event",
-			tc:   replayCaseByName(t, "single_turn"),
-			inject: func(t *testing.T, ctx context.Context, backend backendBundle, key session.Key) {
-				got, err := backend.sessionService.GetSession(ctx, key)
-				require.NoError(t, err)
-				require.NotNil(t, got)
-				require.NoError(t, backend.sessionService.AppendEvent(
-					ctx,
-					got,
-					buildReplayEvent("duplicate_event_injection", 0, replayUserEvent(
-						"duplicate injected event",
-						withReplayInvocation("single-root"),
-						withReplayBranch("root"),
-					)),
-				))
-			},
-			section:  "events",
-			pathGlob: "$.events[2]*",
-			context:  map[string]any{"event_index": 2},
-		},
 		{
 			name: "state_pollution",
 			tc:   replayCaseByName(t, "single_turn"),
