@@ -401,9 +401,14 @@ func TestSummarizeSession_UsesPreviousBoundaryCutoff(t *testing.T) {
 func TestSelectUpdatedAt_Fallbacks(t *testing.T) {
 	prev := time.Date(2023, 1, 2, 9, 0, 0, 0, time.UTC)
 	latest := time.Date(2023, 1, 2, 10, 0, 0, 0, time.UTC)
+	selectUpdatedAt := func(tmp *session.Session, latestTs time.Time, hasDelta bool) time.Time {
+		prevBoundary := session.NewSummaryBoundary("", prev)
+		latestBoundary := session.NewSummaryBoundary("", latestTs)
+		return selectSummaryBoundary(tmp, "", prevBoundary, latestBoundary, hasDelta).CutoffTime()
+	}
 
 	t.Run("no delta keeps prev", func(t *testing.T) {
-		got := selectUpdatedAt(nil, prev, latest, false)
+		got := selectUpdatedAt(nil, latest, false)
 		assert.True(t, got.Equal(prev.UTC()))
 	})
 
@@ -411,17 +416,17 @@ func TestSelectUpdatedAt_Fallbacks(t *testing.T) {
 		tmp := &session.Session{State: session.StateMap{
 			session.SummaryLastIncludedTimestampStateKey: []byte("bad-ts"),
 		}}
-		got := selectUpdatedAt(tmp, prev, latest, true)
+		got := selectUpdatedAt(tmp, latest, true)
 		assert.True(t, got.Equal(latest.UTC()))
 	})
 
 	t.Run("nil session with delta falls back to latest", func(t *testing.T) {
-		got := selectUpdatedAt(nil, prev, latest, true)
+		got := selectUpdatedAt(nil, latest, true)
 		assert.True(t, got.Equal(latest.UTC()))
 	})
 
 	t.Run("zero latestTs with delta keeps prev", func(t *testing.T) {
-		got := selectUpdatedAt(nil, prev, time.Time{}, true)
+		got := selectUpdatedAt(nil, time.Time{}, true)
 		assert.True(t, got.Equal(prev.UTC()))
 	})
 }
@@ -879,6 +884,57 @@ func TestSummarizeSession_CanceledWhileWaitingForSameKey(t *testing.T) {
 
 	close(s.release)
 	require.NoError(t, <-firstDone)
+}
+
+func TestSummarizeSession_CanceledDuringSummarizationDoesNotPersist(t *testing.T) {
+	now := time.Now()
+	base := &session.Session{ID: "s1", AppName: "a", UserID: "u"}
+	base.Events = []event.Event{
+		makeEvent("e1", now.Add(-1*time.Minute), "b1"),
+	}
+	s := &blockingSummarizer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(s.release) })
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct {
+		updated bool
+		err     error
+	}, 1)
+
+	go func() {
+		updated, err := SummarizeSession(ctx, s, base, "b1", false)
+		done <- struct {
+			updated bool
+			err     error
+		}{updated: updated, err: err}
+	}()
+	select {
+	case <-s.started:
+	case <-time.After(time.Second):
+		t.Fatal("summarizer did not start")
+	}
+	cancel()
+	release()
+
+	var got struct {
+		updated bool
+		err     error
+	}
+	select {
+	case got = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled summary did not return")
+	}
+	require.ErrorIs(t, got.err, context.Canceled)
+	require.False(t, got.updated)
+	require.Empty(t, base.Summaries)
 }
 
 func TestSummarizeSession_EmptyDelta_WithForce(t *testing.T) {

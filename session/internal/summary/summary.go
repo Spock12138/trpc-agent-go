@@ -207,6 +207,9 @@ func SummarizeSession(
 	if err != nil {
 		return false, fmt.Errorf("summarize session %s failed: %w", base.ID, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if text == "" {
 		return false, nil
 	}
@@ -489,12 +492,6 @@ func writeSummary(
 	}
 }
 
-func selectUpdatedAt(tmp *session.Session, prevAt, latestTs time.Time, hasDelta bool) time.Time {
-	prev := session.NewSummaryBoundary("", prevAt)
-	latest := session.NewSummaryBoundary("", latestTs)
-	return selectSummaryBoundary(tmp, "", prev, latest, hasDelta).CutoffTime()
-}
-
 func selectSummaryBoundary(
 	tmp *session.Session,
 	filterKey string,
@@ -635,14 +632,6 @@ func skipBranchForkFullSessionCascadeFromContext(ctx context.Context) bool {
 	}
 	skip, _ := ctx.Value(skipBranchForkFullSessionCascadeContextKey{}).(bool)
 	return skip
-}
-
-func readLastIncludedTimestamp(tmp *session.Session) time.Time {
-	boundary := readLastIncludedBoundary(tmp, "")
-	if boundary == nil {
-		return time.Time{}
-	}
-	return boundary.CutoffTime()
 }
 
 func readLastIncludedBoundary(
